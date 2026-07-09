@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sriinnu.codex-compact</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__CODEX_CLEANUP_HOME__/codex_session_cleaner.py</string>
+        <string>compact</string>
+        <string>--keep-days</string>
+        <string>1</string>
+        <string>--min-size</string>
+        <string>1</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>21600</integer>
+    <key>StandardOutPath</key>
+    <string>__CODEX_CLEANUP_HOME__/compact.log</string>
+    <key>StandardErrorPath</key>
+    <string>__CODEX_CLEANUP_HOME__/compact.log</string>
+</dict>
+</plist>

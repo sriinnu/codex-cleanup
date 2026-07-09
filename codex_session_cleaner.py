@@ -9,6 +9,12 @@ they balloon into the gigabytes. This tool:
   report   show disk usage grouped by date (find where the bloat lives)
   clean    blank heavy string VALUES in-place — keys, ids, timestamps,
            line counts all survive, so Codex can still list the sessions
+  compact  lighter touch than clean: drops pure-telemetry lines
+           (token_count, and agent_message since it's a duplicate of the
+           response_item copy) and blanks only exec_command args/output.
+           Reasoning, messages, patches, plans, goal state, sub-agent
+           markers all survive untouched — for sessions you still want to
+           read later, not ones you're writing off.
 
 Usage:
   python3 codex_session_cleaner.py report
@@ -17,6 +23,8 @@ Usage:
   python3 codex_session_cleaner.py clean --before 2026-06-01
   python3 codex_session_cleaner.py clean --keep-days 14
   python3 codex_session_cleaner.py clean --min-size 10        # only files >= 10 MB
+  python3 codex_session_cleaner.py compact --dry-run
+  python3 codex_session_cleaner.py compact --min-size 1
 """
 
 import argparse
@@ -240,6 +248,174 @@ def cmd_clean(args) -> int:
     return 1 if failed else 0
 
 
+# ---------------------------------------------------------------- compact ----
+
+DROP_EVENT_TYPES = {"token_count", "agent_message"}
+
+
+def compact_line(line: str, call_names: dict):
+    """Return (output_line_or_None, changed) for one raw JSONL line.
+
+    None means drop the line entirely. changed=False means: don't bother
+    re-serializing, write the original bytes back untouched. The substring
+    pre-filter skips json.loads for the majority of lines (reasoning,
+    messages, patches, plan updates...) that can't possibly match —
+    both for speed and so untouched lines never risk picking up
+    json.dumps' default whitespace and quietly growing the file.
+    """
+    if '"token_count"' in line or '"agent_message"' in line:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return line, False
+        if obj.get("type") == "event_msg" and obj.get("payload", {}).get("type") in DROP_EVENT_TYPES:
+            return None, True
+        return line, False
+
+    if '"exec_command"' in line or '"function_call_output"' in line:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return line, False
+        if obj.get("type") != "response_item":
+            return line, False
+        p = obj.get("payload", {})
+        pt = p.get("type")
+        changed = False
+        if pt == "function_call":
+            name = p.get("name", "?")
+            cid = p.get("call_id")
+            if cid:
+                call_names[cid] = name
+            if name == "exec_command" and p.get("arguments"):
+                p["arguments"] = ""
+                changed = True
+        elif pt == "function_call_output":
+            cid = p.get("call_id")
+            if call_names.get(cid) == "exec_command":
+                out = p.get("output")
+                if isinstance(out, str) and out:
+                    p["output"] = ""
+                    changed = True
+                elif isinstance(out, dict) and out.get("content"):
+                    out["content"] = ""
+                    changed = True
+        if changed:
+            return json.dumps(obj, separators=(",", ":")) + "\n", True
+        return line, False
+
+    return line, False
+
+
+def compact_file(path: str) -> tuple:
+    """Drop telemetry lines and blank exec_command payloads, atomically.
+
+    Returns (before_bytes, after_bytes, dropped_lines, edited_lines, skip_reason).
+    """
+    before = os.path.getsize(path)
+    orig_stat = os.stat(path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    call_names = {}
+    dropped = edited = 0
+    try:
+        with os.fdopen(fd, "w") as out, open(path, "r", errors="replace") as f:
+            for line in f:
+                new_line, changed = compact_line(line, call_names)
+                if new_line is None:
+                    dropped += 1
+                    continue
+                if changed:
+                    edited += 1
+                out.write(new_line if new_line.endswith("\n") else new_line + "\n")
+
+        # Same concurrent-writer guard as clean_file: bail rather than
+        # silently discard anything Codex appended mid-run.
+        current_stat = os.stat(path)
+        if (current_stat.st_mtime != orig_stat.st_mtime or
+                current_stat.st_size != orig_stat.st_size):
+            os.unlink(tmp)
+            return before, before, 0, 0, "file changed during processing, skipped"
+
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
+
+    try:
+        os.utime(path, (orig_stat.st_atime, orig_stat.st_mtime))
+    except OSError as e:
+        print(f"  (warning: could not restore mtime for {path}: {e})", file=sys.stderr)
+
+    return before, os.path.getsize(path), dropped, edited, None
+
+
+def cmd_compact(args) -> int:
+    cutoff = None
+    if args.before and args.keep_days is not None:
+        print("Pick --before OR --keep-days, not both.", file=sys.stderr)
+        return 2
+    if args.before:
+        cutoff = datetime.strptime(args.before, "%Y-%m-%d").date()
+    elif args.keep_days is not None:
+        cutoff = date.today() - timedelta(days=args.keep_days)
+
+    min_bytes = int(args.min_size * 1024 * 1024)
+
+    targets = []
+    for p in iter_rollouts(args.root):
+        d = file_date(p)
+        if cutoff and (d is None or d >= cutoff):
+            continue
+        if os.path.getsize(p) < min_bytes:
+            continue
+        targets.append(p)
+
+    if not targets:
+        print("Nothing matches — no files to compact.")
+        return 0
+
+    targets.sort(key=os.path.getsize, reverse=True)
+
+    if args.dry_run:
+        print(f"DRY RUN — would compact {len(targets)} files "
+              f"({human(sum(map(os.path.getsize, targets)))}):")
+        for p in targets:
+            print(f"  {human(os.path.getsize(p))}  {p}")
+        return 0
+
+    tb = ta = 0
+    done = skipped = failed = 0
+    for p in targets:
+        try:
+            b, a, dropped, edited, skip_reason = compact_file(p)
+        except Exception as e:
+            failed += 1
+            print(f"  ERROR: {p}: {e}", file=sys.stderr)
+            continue
+        if skip_reason:
+            skipped += 1
+            print(f"  SKIPPED: {p}: {skip_reason}")
+            continue
+        done += 1
+        tb += b
+        ta += a
+        flag = f"  (-{dropped} lines, {edited} blanked)" if (dropped or edited) else "  (nothing to touch)"
+        print(f"{human(b)} -> {human(a)}  {p}{flag}")
+    print("-" * 30)
+    pct = (1 - ta / tb) * 100 if tb else 0
+    summary = f"TOTAL {human(tb)} -> {human(ta)}  ({pct:.1f}% reclaimed, {done} files)"
+    if skipped:
+        summary += f", {skipped} skipped"
+    if failed:
+        summary += f", {failed} failed"
+    print(summary)
+    return 1 if failed else 0
+
+
 # ------------------------------------------------------------------ main ----
 
 def main() -> int:
@@ -261,12 +437,26 @@ def main() -> int:
     cl.add_argument("--dry-run", action="store_true",
                     help="list what would be cleaned, change nothing")
 
+    co = sub.add_parser("compact", help="drop telemetry + blank exec_command, keep everything else")
+    co.add_argument("--before", metavar="YYYY-MM-DD",
+                    help="only compact sessions dated strictly before this")
+    co.add_argument("--keep-days", type=int, metavar="N",
+                    help="keep the last N days untouched, compact the rest")
+    co.add_argument("--min-size", type=float, default=0, metavar="MB",
+                    help="only touch files >= this many MB (default: all)")
+    co.add_argument("--dry-run", action="store_true",
+                    help="list what would be compacted, change nothing")
+
     args = ap.parse_args()
     args.root = os.path.expanduser(args.root)
     if not os.path.isdir(args.root):
         print(f"Root not found: {args.root}", file=sys.stderr)
         return 2
-    return cmd_report(args) if args.cmd == "report" else cmd_clean(args)
+    if args.cmd == "report":
+        return cmd_report(args)
+    if args.cmd == "compact":
+        return cmd_compact(args)
+    return cmd_clean(args)
 
 
 if __name__ == "__main__":

@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+backups/
+*.log
+goal_watch_state.json
+tool-output-archive/
