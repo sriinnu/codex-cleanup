@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sriinnu.codex-vacuum</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/vacuum_logs.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>604800</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/vacuum.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/vacuum.log</string>
+</dict>
+</plist>
