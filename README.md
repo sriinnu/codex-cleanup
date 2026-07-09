@@ -1,74 +1,137 @@
 # codex-cleanup
 
-Codex CLI session rollouts (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`) grow into the
-gigabytes because every context compaction re-writes the *entire* conversation
-history into the file as a `compacted` snapshot, on top of raw tool outputs and
-reasoning blobs. A week of heavy use hit 13 GB on this machine.
+Codex CLI session rollouts (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`) grow into
+the gigabytes because every context compaction re-writes the *entire*
+conversation history into the file, on top of raw tool outputs and reasoning
+blobs. One `/goal` thread left running for 24 days burned 559M tokens on its
+own before hitting `usage_limited`. Full incident writeup: [NOTES.md](NOTES.md).
+Upstream bug report: [openai/codex#24948](https://github.com/openai/codex/issues/24948).
 
-This tool reclaims that space **without deleting files**: it blanks the heavy
-string *values* in place. Keys, ids, timestamps, types, and line counts all
-survive, so the files stay valid JSONL and Codex can still list the sessions.
-Real-world result: 13 GB → 1.4 GB (~90%).
+This repo does two things:
 
-## What gets blanked vs. kept
+1. **Cleans up rollouts already on disk** — two modes, from "purge sessions
+   I don't need anymore" to "shrink a session I still want to read, without
+   losing anything real."
+2. **Fixes the actual token-cost problem at the source** — Codex-native hooks
+   that stop bloat from ever being resent to the model in the first place,
+   plus a watchdog that flags a runaway `/goal` thread in hours, not weeks.
 
-| Blanked (→ `""`)                              | Kept                                   |
-|-----------------------------------------------|----------------------------------------|
-| Tool/shell outputs (`function_call_output`)   | `type`, `id`, `call_id`, `turn_id`     |
-| User + agent messages                         | `timestamp`, `role`, `name`, `status`  |
-| Reasoning / `encrypted_content`               | `cwd`, `model`, `cli_version`, …       |
-| `compacted` history snapshots                 | All numbers, booleans, nulls           |
-| Patch contents, stdout/stderr                 | File and line counts (unchanged)       |
+## Cleanup modes — `codex_session_cleaner.py`
 
-**Warning:** blanking is irreversible. Blanked sessions still list in Codex but
-resume with no memory of their content. Use `--keep-days` to protect recent work.
+| | `report` | `compact` | `clean` |
+|---|---|---|---|
+| **What it does** | Shows disk usage by date, changes nothing | Drops pure telemetry lines (`token_count`, and `agent_message` — verified duplicate of the real record), blanks only `exec_command` args/output | Blanks *all* heavy string values |
+| **Keeps** | — | Reasoning, messages, patches, plans, goal state, sub-agent markers — everything you'd want to read again | Structural keys only (`id`, `timestamp`, `role`, …) |
+| **Use for** | Finding where the bloat lives | Sessions you still want to review, just smaller | Old sessions you're writing off entirely |
+| **Real result** | — | 3.9GB → 1.2GB (68.6%), verified byte-for-byte against untouched backups, zero content loss | 13GB → 1.4GB (~90%), irreversible |
 
-## Quick start
+```bash
+python3 codex_session_cleaner.py report
+python3 codex_session_cleaner.py compact --keep-days 1 --dry-run
+python3 codex_session_cleaner.py compact --keep-days 1 --min-size 1
+python3 codex_session_cleaner.py clean --keep-days 7 --dry-run
+```
+
+Or the interactive one-shot (`clean`, asks first):
 
 ```bash
 ./cleanup.sh
-```
-
-That shows usage by date, a dry-run of what would be cleaned (keeping the last
-7 days), and asks for confirmation before touching anything. Tune with env vars:
-
-```bash
 KEEP_DAYS=14 MIN_SIZE=5 ./cleanup.sh
 ```
 
-## Manual usage
-
-```bash
-# 1. Where's the bloat? (grouped by session date)
-python3 codex_session_cleaner.py report
-
-# 2. Preview — lists targets, changes nothing
-python3 codex_session_cleaner.py clean --keep-days 7 --dry-run
-
-# 3. Clean for real
-python3 codex_session_cleaner.py clean --keep-days 7 --min-size 5
-```
-
-### Options
+### Options (both `compact` and `clean`)
 
 | Flag                  | Meaning                                                |
 |-----------------------|--------------------------------------------------------|
 | `--root PATH`         | Sessions root (default `~/.codex/sessions`)            |
 | `--keep-days N`       | Leave the last N days untouched                        |
-| `--before YYYY-MM-DD` | Only clean sessions dated strictly before this         |
+| `--before YYYY-MM-DD` | Only touch sessions dated strictly before this         |
 | `--min-size MB`       | Only touch files at least this big (default: all)      |
-| `--dry-run`           | List what would be cleaned, modify nothing             |
+| `--dry-run`           | List what would happen, modify nothing                 |
 
-## Safety notes
+### Safety notes
 
 - Writes go to a temp sibling file, then an atomic `os.replace` — a crash
   mid-run can't corrupt a session file.
+- Restores the original atime/mtime after every rewrite — a compacted file
+  still looks like it was created when it actually was, not "just now."
+- Bails (leaves the file untouched) if it detects Codex modified the file
+  mid-run, rather than risk discarding a concurrent write.
 - Unparseable lines become `{}` instead of aborting, preserving line counts.
 - No dependencies — stdlib only, runs on macOS system `python3` (3.8+).
 
-## Run it on a schedule (optional)
+## Real-time hooks — `hooks/`
+
+Codex has its own hooks system (`hooks = true` in `config.toml`, config at
+`~/.codex/hooks.json`, deployed copy in `deployed/hooks.json`) — separate
+from MCP, separate from plugins. These intervene *while a session is live*,
+instead of cleaning up after the fact. All three are wrapped to fail silent
+and fast on any error — a bug here must never block or slow down a real
+Codex session.
+
+| Hook | Script | Does |
+|---|---|---|
+| `PostToolUse` | `posttooluse_exec_compact.py` | **The actual token-cost fix.** Fires after every tool call. If `exec_command` output is large, archives the full raw text to `tool-output-archive/<session_id>/<call_id>.txt` and substitutes a head-tail-truncated version into the *recorded* transcript — so the bloat never gets resent on a future turn in the first place. |
+| `PreCompact` | `precompact_warn.py` | Fires the instant Codex decides a thread needs compacting. Cross-checks `~/.codex/goals_1.sqlite`; if the thread's already over 20M tokens or 3 days old, surfaces a warning right inside the live session plus a macOS notification. |
+| `PostCompact` | `postcompact_compact.py` | Hooks are blocking, so Codex is genuinely idle on the transcript during this hook — a real, race-free window. Runs the same targeted compaction immediately, instead of waiting for the next scheduled pass. |
+
+**Tuning note:** Codex has its own native exec-output truncation ceiling
+(~1,000–2,000 raw chars, confirmed empirically — 1,000 chars passed through
+untouched, 2,000 got truncated to ~300 by Codex itself before the hook ever
+saw it). `posttooluse_exec_compact.py`'s `KEEP_HEAD`/`KEEP_TAIL` are set
+below that ceiling on purpose, to catch what Codex lets through untouched
+rather than duplicate work it already does. See `NOTES.md` for how this was
+found and calibrated, including a bug where text shorter than
+`KEEP_HEAD + KEEP_TAIL` produced a negative "chars truncated" count.
+
+Debug a hook without touching a real session:
 
 ```bash
-# crontab -e  — every Sunday at 10:00, no prompt:
-0 10 * * 0 /usr/bin/python3 /Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/codex_session_cleaner.py clean --keep-days 14 --min-size 5
+echo '{"session_id":"test","tool_name":"exec_command","tool_use_id":"c1","tool_response":{"output":"..."}}' \
+  | python3 hooks/posttooluse_exec_compact.py
+
+# or trace what a hook actually receives from a live session:
+CODEX_HOOK_DEBUG=1 codex exec "..." 2>&1
+cat hooks/debug.log
 ```
+
+## Watchdogs — `goal_watch.py` + `vacuum_logs.sh`
+
+Run via `launchd`, not `cron` — cron has no catch-up on macOS, so a job
+scheduled for a fixed time just silently doesn't run if the laptop's asleep
+then. `launchd` agents trigger on load (login) plus a periodic interval, so
+they survive sleep/wake. Plists live in `~/Library/LaunchAgents/`, copies
+kept in `deployed/` here.
+
+| Agent | Does | Cadence |
+|---|---|---|
+| `com.sriinnu.codex-compact` | `codex_session_cleaner.py compact --keep-days 1` | RunAtLoad + every 6h |
+| `com.sriinnu.codex-vacuum` | `VACUUM`s `~/.codex/logs_2.sqlite` (Codex deletes old log rows but never reclaims the freed pages — a plain `VACUUM` alone took this from 2.5GB to 679MB with zero rows touched) | RunAtLoad + weekly |
+| `com.sriinnu.codex-goal-watch` | `goal_watch.py` — flags any `/goal` thread over 20M tokens or 3 days old via macOS notification, throttled to one nag per thread per 12h | RunAtLoad + every 2h |
+
+```bash
+python3 goal_watch.py
+python3 goal_watch.py --token-threshold 20000000 --age-days 3 --quiet
+
+bash vacuum_logs.sh   # backs up first, skips if Codex looks like it's running
+```
+
+## Directory layout
+
+```
+codex_session_cleaner.py   report / compact / clean
+goal_watch.py               goals_1.sqlite watchdog
+vacuum_logs.sh               logs_2.sqlite VACUUM
+hooks/                      Codex-native PostToolUse/PreCompact/PostCompact
+deployed/                   copies of the live hooks.json + launchd plists
+backups/                    gitignored — local safety net, too large for the repo
+tool-output-archive/        gitignored — full raw exec output PostToolUse archives
+NOTES.md                    full incident writeup, findings, what's still open
+```
+
+## What's still open
+
+See [NOTES.md](NOTES.md#whats-still-open) — the filed upstream issue, two
+goal threads that wouldn't archive, and the log-vacuum job being a
+recurring workaround rather than a real fix for Codex's own delete-without-
+vacuum behavior.
