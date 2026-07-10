@@ -16,12 +16,21 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import sqlite3
-import subprocess
 import sys
 import time
+
+# notify_common.py sits next to this file at the repo root; running the
+# script directly (or via subprocess, as the tests and launchd both do)
+# already puts that directory at sys.path[0], so no path surgery needed.
+#
+# Unlike hooks/precompact_warn.py, this import is deliberately NOT wrapped
+# in a fallback: this is a standalone launchd job, not something wired into
+# a live Codex session, so a broken notify_common.py should fail loudly
+# (non-zero exit, visible in launchd logs) rather than silently run "clean"
+# while never actually notifying anyone about a runaway thread.
+from notify_common import notify, load_notify_state, save_notify_state
 
 # Env override exists for the deployed/launchd case if someone relocates the checkout.
 CLEANUP_HOME = os.environ.get("CODEX_CLEANUP_HOME") or os.path.dirname(os.path.abspath(__file__))
@@ -34,24 +43,11 @@ LIVE_STATUSES = ("active", "paused", "blocked", "usage_limited", "budget_limited
 
 
 def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+    return load_notify_state(STATE_FILE)
 
 
 def save_state(state: dict) -> None:
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def notify(title: str, message: str) -> None:
-    script = f"display notification {json.dumps(message)} with title {json.dumps(title)}"
-    subprocess.run(["osascript", "-e", script], check=False)
+    save_notify_state(STATE_FILE, state)
 
 
 def main() -> int:
@@ -83,6 +79,7 @@ def main() -> int:
     state = load_state()
     flagged = []
     for thread_id, objective, status, tokens_used, created_at_ms in rows:
+        tokens_used = tokens_used or 0  # NULL until the thread logs its first token count
         age_days = (now_ms - created_at_ms) / 86_400_000
         over_tokens = tokens_used >= args.token_threshold
         over_age = age_days >= args.age_days
@@ -110,7 +107,7 @@ def main() -> int:
         if not args.quiet:
             notify(
                 "Codex /goal running long",
-                f"{tokens_used:,} tokens, {age_days:.1f} days — {short_obj}",
+                f"{tokens_used:,} tokens, {age_days:.1f} days - {short_obj}",
             )
 
     # Saved only after the notifications actually went out — recording a

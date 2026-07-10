@@ -18,7 +18,6 @@ Fails silent and fast on any error.
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import time
 
@@ -26,25 +25,34 @@ import time
 CLEANUP_HOME = os.environ.get("CODEX_CLEANUP_HOME") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))
 
+try:
+    # notify_common.py lives at the repo root, one level up from hooks/.
+    # Resolve via this file's own real path (not CLEANUP_HOME, which tests
+    # deliberately override to a throwaway state dir) so the sibling import
+    # always finds it.
+    _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    from notify_common import notify, load_notify_state, save_notify_state  # noqa: E402
+except Exception:
+    # This file's whole contract is "always exits 0, never raises uncaught"
+    # — a missing/broken notify_common.py (partial deployment, someone
+    # copied just hooks/ around) must degrade the popup silently, not turn
+    # a documented no-op-on-error hook into a crashing one.
+    def notify(title, message):
+        pass
+
+    def load_notify_state(state_file):
+        return {}
+
+    def save_notify_state(state_file, state):
+        pass
+
 DB = os.path.expanduser("~/.codex/goals_1.sqlite")
 TOKEN_THRESHOLD = 20_000_000
 AGE_DAYS_THRESHOLD = 3.0
 STATE_FILE = os.path.join(CLEANUP_HOME, "precompact_state.json")
 RENOTIFY_SECONDS = 12 * 3600  # popup at most once per thread per 12h; systemMessage still fires every time
-
-
-def notify(title: str, message: str) -> None:
-    try:
-        # osascript's -e argument handling is flaky with non-ASCII punctuation
-        # (em-dashes, curly quotes) depending on locale — strip to plain ASCII
-        # rather than risk a silent notification failure over cosmetics.
-        title = title.encode("ascii", "ignore").decode()
-        message = message.encode("ascii", "ignore").decode()
-        script = f"display notification {json.dumps(message)} with title {json.dumps(title)}"
-        subprocess.run(["osascript", "-e", script], check=False, timeout=3,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
 
 
 def should_notify(thread_id: str) -> bool:
@@ -56,20 +64,12 @@ def should_notify(thread_id: str) -> bool:
     """
     try:
         now_ms = time.time() * 1000
-        state = {}
-        try:
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-            if not isinstance(state, dict):
-                state = {}
-        except Exception:
-            state = {}
+        state = load_notify_state(STATE_FILE)
         if now_ms - state.get(thread_id, 0) < RENOTIFY_SECONDS * 1000:
             return False
         state[thread_id] = now_ms
         try:
-            with open(STATE_FILE, "w") as f:
-                json.dump(state, f)
+            save_notify_state(STATE_FILE, state)
         except Exception:
             pass
         return True
@@ -96,6 +96,7 @@ def main() -> int:
             return 0
 
         objective, status, tokens_used, created_at_ms = row
+        tokens_used = tokens_used or 0  # NULL until the thread logs its first token count
         age_days = (time.time() * 1000 - created_at_ms) / 86_400_000
 
         if tokens_used < TOKEN_THRESHOLD and age_days < AGE_DAYS_THRESHOLD:
