@@ -3,4 +3,5 @@ __pycache__/
 backups/
 *.log
 goal_watch_state.json
+precompact_state.json
 tool-output-archive/

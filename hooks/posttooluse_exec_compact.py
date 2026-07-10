@@ -19,7 +19,11 @@ import os
 import sys
 import time
 
-ARCHIVE_ROOT = os.path.expanduser("~/Sriinnu/Personal/codex-cleanup/tool-output-archive")
+# Env override exists for the deployed/launchd case if someone relocates the checkout.
+CLEANUP_HOME = os.environ.get("CODEX_CLEANUP_HOME") or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))
+
+ARCHIVE_ROOT = os.path.join(CLEANUP_HOME, "tool-output-archive")
 # Codex's own native exec-output truncation kicks in somewhere around
 # 1000-2000 raw chars (confirmed empirically: 1000 chars passed through
 # untouched, 2000 chars got truncated to ~300 by Codex itself before this
@@ -30,7 +34,8 @@ KEEP_HEAD = 300
 KEEP_TAIL = 300
 MIN_SAVINGS = 400
 TRUNCATE_THRESHOLD = KEEP_HEAD + KEEP_TAIL + MIN_SAVINGS
-TOOL_NAMES = {"exec_command", "Bash", "bash", "shell"}
+# Codex only ever sends "exec_command" (empirically confirmed); "shell" kept as cheap insurance against a rename.
+TOOL_NAMES = {"exec_command", "shell"}
 
 
 def extract_text(tool_response) -> str:
@@ -48,7 +53,7 @@ def extract_text(tool_response) -> str:
     return json.dumps(tool_response)
 
 
-DEBUG_LOG = os.path.expanduser("~/Sriinnu/Personal/codex-cleanup/hooks/debug.log")
+DEBUG_LOG = os.path.join(CLEANUP_HOME, "hooks", "debug.log")
 DEBUG_ENABLED = bool(os.environ.get("CODEX_HOOK_DEBUG"))
 
 
@@ -56,7 +61,7 @@ def debug(msg: str) -> None:
     if not DEBUG_ENABLED:
         return
     try:
-        with open(DEBUG_LOG, "a") as f:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
     except Exception:
         pass
@@ -84,7 +89,11 @@ def main() -> int:
         archive_dir = os.path.join(ARCHIVE_ROOT, session_id)
         os.makedirs(archive_dir, exist_ok=True)
         archive_path = os.path.join(archive_dir, f"{tool_use_id}.txt")
-        with open(archive_path, "w") as f:
+        # Explicit utf-8: on a non-UTF-8 locale the platform default (e.g.
+        # cp1252) makes this write raise on any exotic char, and the
+        # fail-silent envelope would then skip the block decision entirely —
+        # full bloat in the transcript plus a misleading 0-byte archive.
+        with open(archive_path, "w", encoding="utf-8") as f:
             f.write(text)
 
         head = text[:KEEP_HEAD]
