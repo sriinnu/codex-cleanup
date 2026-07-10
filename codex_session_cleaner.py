@@ -284,58 +284,74 @@ def cmd_clean(args) -> int:
 
 DROP_EVENT_TYPES = {"token_count", "agent_message"}
 
+# Substrings that mean a line might need work at all — skips json.loads for
+# the majority of lines (reasoning, messages, patches, plan updates...) that
+# can't possibly match, both for speed and so untouched lines never risk
+# picking up json.dumps' default whitespace and quietly growing the file.
+TRIGGER_SUBSTRINGS = ('"token_count"', '"agent_message"',
+                      '"exec_command"', '"function_call_output"')
+
+# Wording must match the placeholder hooks/posttooluse_exec_compact.py writes
+# into function_call_output.output when it archives+truncates a large exec
+# result (see its `reason` string). If output already carries this marker,
+# it's already the small pointer to the archive — blanking it would erase
+# the transcript's only recorded path to the original.
+ARCHIVED_MARKER = "chars truncated — full output archived at"
+
+
+def _already_archived(text) -> bool:
+    return isinstance(text, str) and ARCHIVED_MARKER in text
+
 
 def compact_line(line: str, call_names: dict):
     """Return (output_line_or_None, changed) for one raw JSONL line.
 
     None means drop the line entirely. changed=False means: don't bother
-    re-serializing, write the original bytes back untouched. The substring
-    pre-filter skips json.loads for the majority of lines (reasoning,
-    messages, patches, plan updates...) that can't possibly match —
-    both for speed and so untouched lines never risk picking up
-    json.dumps' default whitespace and quietly growing the file.
+    re-serializing, write the original bytes back untouched. Every trigger
+    substring is checked up front and the line parsed at most once — an
+    exec_command function_call_output whose own content happens to contain
+    an incidental "token_count"/"agent_message" substring must still reach
+    the exec-blanking branch below, not bail out on the telemetry check.
     """
-    if '"token_count"' in line or '"agent_message"' in line:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            return line, False
-        if obj.get("type") == "event_msg" and obj.get("payload", {}).get("type") in DROP_EVENT_TYPES:
+    if not any(s in line for s in TRIGGER_SUBSTRINGS):
+        return line, False
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return line, False
+
+    if obj.get("type") == "event_msg":
+        if obj.get("payload", {}).get("type") in DROP_EVENT_TYPES:
             return None, True
         return line, False
 
-    if '"exec_command"' in line or '"function_call_output"' in line:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            return line, False
-        if obj.get("type") != "response_item":
-            return line, False
-        p = obj.get("payload", {})
-        pt = p.get("type")
-        changed = False
-        if pt == "function_call":
-            name = p.get("name", "?")
-            cid = p.get("call_id")
-            if cid:
-                call_names[cid] = name
-            if name == "exec_command" and p.get("arguments"):
-                p["arguments"] = ""
-                changed = True
-        elif pt == "function_call_output":
-            cid = p.get("call_id")
-            if call_names.get(cid) == "exec_command":
-                out = p.get("output")
-                if isinstance(out, str) and out:
-                    p["output"] = ""
-                    changed = True
-                elif isinstance(out, dict) and out.get("content"):
-                    out["content"] = ""
-                    changed = True
-        if changed:
-            return json.dumps(obj, separators=(",", ":")) + "\n", True
+    if obj.get("type") != "response_item":
         return line, False
 
+    p = obj.get("payload", {})
+    pt = p.get("type")
+    changed = False
+    if pt == "function_call":
+        name = p.get("name", "?")
+        cid = p.get("call_id")
+        if cid:
+            call_names[cid] = name
+        if name == "exec_command" and p.get("arguments"):
+            p["arguments"] = ""
+            changed = True
+    elif pt == "function_call_output":
+        cid = p.get("call_id")
+        if call_names.get(cid) == "exec_command":
+            out = p.get("output")
+            if isinstance(out, str) and out and not _already_archived(out):
+                p["output"] = ""
+                changed = True
+            elif isinstance(out, dict) and not _already_archived(out.get("content")):
+                if out.get("content"):
+                    out["content"] = ""
+                    changed = True
+    if changed:
+        return json.dumps(obj, separators=(",", ":")) + "\n", True
     return line, False
 
 
@@ -417,9 +433,48 @@ def add_selection_flags(sp, verb: str) -> None:
 
 def add_root_flag(sp) -> None:
     # Per-subcommand: on the main parser the documented `report --root ...`
-    # order is a parse error, and dual definition lets defaults clobber it.
+    # order is a parse error, and dual definition lets defaults clobber it
+    # (argparse subparsers build their own namespace and overwrite the
+    # caller's value — see _normalize_root_argv below for the other half
+    # of this fix, which lets `--root ... <cmd>` keep working too).
     sp.add_argument("--root", default=DEFAULT_ROOT,
                     help=f"sessions root (default: {DEFAULT_ROOT})")
+
+
+SUBCOMMANDS = ("report", "clean", "compact")
+
+
+def _normalize_root_argv(argv):
+    """Splice a leading `--root VALUE`/`--root=VALUE` to just after the subcommand.
+
+    --root only lives on the subparsers (see add_root_flag's comment), so
+    `<cmd> --root X` works natively. `--root X <cmd>` used to work before
+    --root moved off the main parser; rewriting it into the subparser-native
+    order here keeps both documented forms working without re-adding --root
+    to the main parser (which reintroduces the clobbering bug).
+    """
+    out = []
+    pending = []
+    inserted = False
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if not inserted and tok == "--root" and i + 1 < len(argv):
+            pending += [tok, argv[i + 1]]
+            i += 2
+            continue
+        if not inserted and tok.startswith("--root="):
+            pending.append(tok)
+            i += 1
+            continue
+        out.append(tok)
+        if not inserted and tok in SUBCOMMANDS:
+            out += pending
+            pending = []
+            inserted = True
+        i += 1
+    out += pending  # no subcommand found; let argparse report the usage error
+    return out
 
 
 def main() -> int:
@@ -434,7 +489,7 @@ def main() -> int:
     add_selection_flags(sub.add_parser(
         "compact", help="drop telemetry + blank exec_command, keep everything else"), "compact")
 
-    args = ap.parse_args()
+    args = ap.parse_args(_normalize_root_argv(sys.argv[1:]))
     args.root = os.path.expanduser(args.root)
     if not os.path.isdir(args.root):
         print(f"Root not found: {args.root}", file=sys.stderr)

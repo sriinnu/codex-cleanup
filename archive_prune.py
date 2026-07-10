@@ -27,6 +27,10 @@ import os
 import sys
 import time
 
+# archive_prune.py sits next to codex_session_cleaner.py at the repo root;
+# running either directly puts that directory at sys.path[0].
+from codex_session_cleaner import human
+
 DEFAULT_ROOT = os.path.join(
     os.environ.get("CODEX_CLEANUP_HOME")
     or os.path.dirname(os.path.abspath(__file__)),
@@ -34,16 +38,8 @@ DEFAULT_ROOT = os.path.join(
 )
 
 
-def human(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:7.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"  # unreachable, keeps type-checkers calm
-
-
 def scan(root: str) -> list:
-    """Collect (mtime, size, path) for every archived .txt under root.
+    """Collect (mtime, size, path, session_dir) for every archived .txt under root.
 
     Anything that isn't a plain .txt regular file — loose non-archive files,
     symlinks, unexpected nesting — is left strictly alone: this tool only
@@ -61,7 +57,7 @@ def scan(root: str) -> list:
                 st = os.stat(p)
             except OSError:
                 continue  # vanished between listing and stat — nothing to prune
-            entries.append((st.st_mtime, st.st_size, p))
+            entries.append((st.st_mtime, st.st_size, p, dirpath))
     return entries
 
 
@@ -72,11 +68,34 @@ def pick_targets(entries: list, keep_days: int, max_total_bytes: int, now: float
     A future mtime (clock skew, touch gone wrong) can never satisfy
     mtime < cutoff, so the age rule inherently never deletes it; the size
     cap sorts oldest-first, so future-dated files go last there too.
+
+    The age pass additionally spares a whole session directory if ANY of its
+    archived outputs is still within the retention window — posttooluse_
+    exec_compact.py promises the full original is "always recoverable from
+    the archive", but a long-running /goal thread (the exact incident this
+    repo exists to fix — see NOTES.md) keeps archiving new calls for weeks,
+    so its early calls would otherwise individually age out from under a
+    still-open, still-referencing transcript. The size cap stays activity-
+    blind on purpose: it's the safety valve for a single runaway day dumping
+    gigabytes, and that's most likely to be an active session.
+
+    A future mtime is excluded from that "session is active" signal (though
+    still individually spared by the m < cutoff check above): clock skew on
+    one file must not stand in for real activity and permanently shield
+    every other file in that directory, forever, on every future run.
     """
     cutoff = now - keep_days * 86400
-    targets = [(m, s, p, "age") for m, s, p in entries if m < cutoff]
+    session_latest = {}
+    for m, _s, _p, d in entries:
+        if m > now:
+            continue  # clock skew, not real activity — doesn't protect siblings
+        if m > session_latest.get(d, float("-inf")):
+            session_latest[d] = m
+
+    targets = [(m, s, p, "age") for m, s, p, d in entries
+              if m < cutoff and session_latest.get(d, float("-inf")) < cutoff]
     doomed = {p for _, _, p, _ in targets}
-    kept = sorted(e for e in entries if e[2] not in doomed)  # oldest first
+    kept = sorted((m, s, p) for m, s, p, d in entries if p not in doomed)  # oldest first
 
     kept_bytes = sum(s for _, s, _ in kept)
     while kept and kept_bytes > max_total_bytes:

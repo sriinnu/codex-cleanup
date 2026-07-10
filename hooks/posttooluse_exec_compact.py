@@ -16,6 +16,7 @@ or slow down a real Codex session. Always exits 0.
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -36,6 +37,23 @@ MIN_SAVINGS = 400
 TRUNCATE_THRESHOLD = KEEP_HEAD + KEEP_TAIL + MIN_SAVINGS
 # Codex only ever sends "exec_command" (empirically confirmed); "shell" kept as cheap insurance against a rename.
 TOOL_NAMES = {"exec_command", "shell"}
+
+_UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def sanitize_id(value) -> str:
+    """Make an untrusted id safe to use as a single archive path component.
+
+    session_id/tool_use_id come straight off the hook's stdin payload with
+    no validation — including no guarantee they're even strings. Coerce
+    first (a non-str value must degrade to *some* safe id, not raise and
+    silently skip archiving+truncation for that call). Collapse anything
+    but a conservative charset, then strip leading/trailing '.'/'_' so a
+    value like "../../x" can't survive as "..", and cap the length well
+    under filesystem name limits so a pathological id can't ENAMETOOLONG.
+    """
+    cleaned = _UNSAFE_ID_CHARS.sub("_", str(value)).strip("._")
+    return (cleaned or "unknown")[:200]
 
 
 def extract_text(tool_response) -> str:
@@ -83,17 +101,31 @@ def main() -> int:
             debug("SKIP: under threshold")
             return 0
 
-        session_id = payload.get("session_id", "unknown")
-        tool_use_id = payload.get("tool_use_id") or f"noid-{int(time.time()*1000)}"
+        session_id = sanitize_id(payload.get("session_id") or "unknown")
+        tool_use_id = sanitize_id(payload.get("tool_use_id") or f"noid-{int(time.time()*1000)}")
 
         archive_dir = os.path.join(ARCHIVE_ROOT, session_id)
         os.makedirs(archive_dir, exist_ok=True)
+
+        # sanitize_id() blocks traversal via the id text itself, but not a
+        # symlink someone (same-user local access) already planted in the
+        # archive tree, which os.makedirs/open would otherwise follow right
+        # out of ARCHIVE_ROOT. Refuse rather than write through it.
+        real_root = os.path.realpath(ARCHIVE_ROOT)
+        real_dir = os.path.realpath(archive_dir)
+        if real_dir != real_root and not real_dir.startswith(real_root + os.sep):
+            debug(f"REFUSED: archive_dir escaped ARCHIVE_ROOT via symlink: {real_dir}")
+            return 0
+
         archive_path = os.path.join(archive_dir, f"{tool_use_id}.txt")
         # Explicit utf-8: on a non-UTF-8 locale the platform default (e.g.
         # cp1252) makes this write raise on any exotic char, and the
         # fail-silent envelope would then skip the block decision entirely —
         # full bloat in the transcript plus a misleading 0-byte archive.
-        with open(archive_path, "w", encoding="utf-8") as f:
+        # O_NOFOLLOW: refuse to write through archive_path itself if it's
+        # already a symlink (same escape as above, one level lower).
+        fd = os.open(archive_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
 
         head = text[:KEEP_HEAD]
