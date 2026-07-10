@@ -88,7 +88,7 @@ def cmd_report(args) -> int:
         d = file_date(p) or "?"
         sz = os.path.getsize(p)
         by_date[str(d)][0] += sz
-        by_date[str(d)][1] += sz and 1
+        by_date[str(d)][1] += 1
         total += sz
 
     if not by_date:
@@ -103,6 +103,90 @@ def cmd_report(args) -> int:
     print("-" * 30)
     print(f"{'TOTAL':<12} {sum(v[1] for v in by_date.values()):>5} {human(total):>10}")
     return 0
+
+
+# ------------------------------------------------------- batch machinery ----
+# clean and compact share the exact same selection + batch-run skeleton;
+# only the per-file transform and the wording differ, so both live here once.
+
+def select_targets(args):
+    """Resolve --before/--keep-days/--min-size into a worklist.
+
+    Returns (targets, error_code_or_None). targets is sorted biggest-first;
+    error_code is 2 on the --before/--keep-days conflict (message already
+    printed), else None.
+    """
+    if args.before and args.keep_days is not None:
+        print("Pick --before OR --keep-days, not both.", file=sys.stderr)
+        return [], 2
+    cutoff = None
+    if args.before:
+        cutoff = datetime.strptime(args.before, "%Y-%m-%d").date()
+    elif args.keep_days is not None:
+        cutoff = date.today() - timedelta(days=args.keep_days)
+
+    min_bytes = int(args.min_size * 1024 * 1024)
+
+    targets = []
+    for p in iter_rollouts(args.root):
+        d = file_date(p)
+        if cutoff and (d is None or d >= cutoff):
+            continue  # too recent (or undated) -> leave it alone
+        if os.path.getsize(p) < min_bytes:
+            continue
+        targets.append(p)
+
+    targets.sort(key=os.path.getsize, reverse=True)  # big fish first
+    return targets, None
+
+
+def run_batch(targets, args, process_fn, verb: str) -> int:
+    """Dry-run listing, per-file processing loop, and TOTAL summary.
+
+    process_fn(path) -> (before_bytes, after_bytes, flag_suffix, skip_reason);
+    the flag suffix is the command-specific per-file annotation, already
+    formatted (empty string for none).
+    """
+    if not targets:
+        print(f"Nothing matches — no files to {verb}.")
+        return 0
+
+    if args.dry_run:
+        print(f"DRY RUN — would {verb} {len(targets)} files "
+              f"({human(sum(map(os.path.getsize, targets)))}):")
+        for p in targets:
+            print(f"  {human(os.path.getsize(p))}  {p}")
+        return 0
+
+    tb = ta = 0
+    done = skipped = failed = 0
+    for p in targets:
+        # Catching Exception (not BaseException) is deliberate: one bad file
+        # must not stop the batch, but Ctrl-C (KeyboardInterrupt) still has
+        # to work — it isn't an Exception subclass, so it isn't swallowed.
+        try:
+            b, a, flag, skip_reason = process_fn(p)
+        except Exception as e:
+            failed += 1
+            print(f"  ERROR: {p}: {e}", file=sys.stderr)
+            continue
+        if skip_reason:
+            skipped += 1
+            print(f"  SKIPPED: {p}: {skip_reason}")
+            continue
+        done += 1
+        tb += b
+        ta += a
+        print(f"{human(b)} -> {human(a)}  {p}{flag}")
+    print("-" * 30)
+    pct = (1 - ta / tb) * 100 if tb else 0
+    summary = f"TOTAL {human(tb)} -> {human(ta)}  ({pct:.1f}% reclaimed, {done} files)"
+    if skipped:
+        summary += f", {skipped} skipped"
+    if failed:
+        summary += f", {failed} failed"
+    print(summary)
+    return 1 if failed else 0
 
 
 # ----------------------------------------------------------------- clean ----
@@ -182,70 +266,18 @@ def clean_file(path: str) -> tuple:
     return before, os.path.getsize(path), bad, None
 
 
+def _clean_one(path: str) -> tuple:
+    """Adapt clean_file to the run_batch process_fn contract."""
+    b, a, bad, skip_reason = clean_file(path)
+    flag = f"  ({bad} unparseable lines)" if bad else ""
+    return b, a, flag, skip_reason
+
+
 def cmd_clean(args) -> int:
-    cutoff = None
-    if args.before and args.keep_days is not None:
-        print("Pick --before OR --keep-days, not both.", file=sys.stderr)
-        return 2
-    if args.before:
-        cutoff = datetime.strptime(args.before, "%Y-%m-%d").date()
-    elif args.keep_days is not None:
-        cutoff = date.today() - timedelta(days=args.keep_days)
-
-    min_bytes = int(args.min_size * 1024 * 1024)
-
-    targets = []
-    for p in iter_rollouts(args.root):
-        d = file_date(p)
-        if cutoff and (d is None or d >= cutoff):
-            continue  # too recent (or undated) -> leave it alone
-        if os.path.getsize(p) < min_bytes:
-            continue
-        targets.append(p)
-
-    if not targets:
-        print("Nothing matches — no files to clean.")
-        return 0
-
-    targets.sort(key=os.path.getsize, reverse=True)  # big fish first
-
-    if args.dry_run:
-        print(f"DRY RUN — would clean {len(targets)} files "
-              f"({human(sum(map(os.path.getsize, targets)))}):")
-        for p in targets:
-            print(f"  {human(os.path.getsize(p))}  {p}")
-        return 0
-
-    tb = ta = 0
-    cleaned = skipped = failed = 0
-    for p in targets:
-        # Catching Exception (not BaseException) is deliberate: one bad file
-        # must not stop the batch, but Ctrl-C (KeyboardInterrupt) still has
-        # to work — it isn't an Exception subclass, so it isn't swallowed.
-        try:
-            b, a, bad, skip_reason = clean_file(p)
-        except Exception as e:
-            failed += 1
-            print(f"  ERROR: {p}: {e}", file=sys.stderr)
-            continue
-        if skip_reason:
-            skipped += 1
-            print(f"  SKIPPED: {p}: {skip_reason}")
-            continue
-        cleaned += 1
-        tb += b
-        ta += a
-        flag = f"  ({bad} unparseable lines)" if bad else ""
-        print(f"{human(b)} -> {human(a)}  {p}{flag}")
-    print("-" * 30)
-    pct = (1 - ta / tb) * 100 if tb else 0
-    summary = f"TOTAL {human(tb)} -> {human(ta)}  ({pct:.1f}% reclaimed, {cleaned} files)"
-    if skipped:
-        summary += f", {skipped} skipped"
-    if failed:
-        summary += f", {failed} failed"
-    print(summary)
-    return 1 if failed else 0
+    targets, err = select_targets(args)
+    if err is not None:
+        return err
+    return run_batch(targets, args, _clean_one, "clean")
 
 
 # ---------------------------------------------------------------- compact ----
@@ -353,99 +385,54 @@ def compact_file(path: str) -> tuple:
     return before, os.path.getsize(path), dropped, edited, None
 
 
+def _compact_one(path: str) -> tuple:
+    """Adapt compact_file to the run_batch process_fn contract."""
+    b, a, dropped, edited, skip_reason = compact_file(path)
+    flag = (f"  (-{dropped} lines, {edited} blanked)"
+            if (dropped or edited) else "  (nothing to touch)")
+    return b, a, flag, skip_reason
+
+
 def cmd_compact(args) -> int:
-    cutoff = None
-    if args.before and args.keep_days is not None:
-        print("Pick --before OR --keep-days, not both.", file=sys.stderr)
-        return 2
-    if args.before:
-        cutoff = datetime.strptime(args.before, "%Y-%m-%d").date()
-    elif args.keep_days is not None:
-        cutoff = date.today() - timedelta(days=args.keep_days)
-
-    min_bytes = int(args.min_size * 1024 * 1024)
-
-    targets = []
-    for p in iter_rollouts(args.root):
-        d = file_date(p)
-        if cutoff and (d is None or d >= cutoff):
-            continue
-        if os.path.getsize(p) < min_bytes:
-            continue
-        targets.append(p)
-
-    if not targets:
-        print("Nothing matches — no files to compact.")
-        return 0
-
-    targets.sort(key=os.path.getsize, reverse=True)
-
-    if args.dry_run:
-        print(f"DRY RUN — would compact {len(targets)} files "
-              f"({human(sum(map(os.path.getsize, targets)))}):")
-        for p in targets:
-            print(f"  {human(os.path.getsize(p))}  {p}")
-        return 0
-
-    tb = ta = 0
-    done = skipped = failed = 0
-    for p in targets:
-        try:
-            b, a, dropped, edited, skip_reason = compact_file(p)
-        except Exception as e:
-            failed += 1
-            print(f"  ERROR: {p}: {e}", file=sys.stderr)
-            continue
-        if skip_reason:
-            skipped += 1
-            print(f"  SKIPPED: {p}: {skip_reason}")
-            continue
-        done += 1
-        tb += b
-        ta += a
-        flag = f"  (-{dropped} lines, {edited} blanked)" if (dropped or edited) else "  (nothing to touch)"
-        print(f"{human(b)} -> {human(a)}  {p}{flag}")
-    print("-" * 30)
-    pct = (1 - ta / tb) * 100 if tb else 0
-    summary = f"TOTAL {human(tb)} -> {human(ta)}  ({pct:.1f}% reclaimed, {done} files)"
-    if skipped:
-        summary += f", {skipped} skipped"
-    if failed:
-        summary += f", {failed} failed"
-    print(summary)
-    return 1 if failed else 0
+    targets, err = select_targets(args)
+    if err is not None:
+        return err
+    return run_batch(targets, args, _compact_one, "compact")
 
 
 # ------------------------------------------------------------------ main ----
 
+def add_selection_flags(sp, verb: str) -> None:
+    """Attach the shared clean/compact selection flags, worded per-command."""
+    add_root_flag(sp)
+    sp.add_argument("--before", metavar="YYYY-MM-DD",
+                    help=f"only {verb} sessions dated strictly before this")
+    sp.add_argument("--keep-days", type=int, metavar="N",
+                    help=f"keep the last N days untouched, {verb} the rest")
+    sp.add_argument("--min-size", type=float, default=0, metavar="MB",
+                    help="only touch files >= this many MB (default: all)")
+    sp.add_argument("--dry-run", action="store_true",
+                    help=f"list what would be {verb}ed, change nothing")
+
+
+def add_root_flag(sp) -> None:
+    # Per-subcommand: on the main parser the documented `report --root ...`
+    # order is a parse error, and dual definition lets defaults clobber it.
+    sp.add_argument("--root", default=DEFAULT_ROOT,
+                    help=f"sessions root (default: {DEFAULT_ROOT})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default=DEFAULT_ROOT,
-                    help=f"sessions root (default: {DEFAULT_ROOT})")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("report", help="disk usage by date")
+    add_root_flag(sub.add_parser("report", help="disk usage by date"))
 
-    cl = sub.add_parser("clean", help="blank heavy string values in-place")
-    cl.add_argument("--before", metavar="YYYY-MM-DD",
-                    help="only clean sessions dated strictly before this")
-    cl.add_argument("--keep-days", type=int, metavar="N",
-                    help="keep the last N days untouched, clean the rest")
-    cl.add_argument("--min-size", type=float, default=0, metavar="MB",
-                    help="only touch files >= this many MB (default: all)")
-    cl.add_argument("--dry-run", action="store_true",
-                    help="list what would be cleaned, change nothing")
-
-    co = sub.add_parser("compact", help="drop telemetry + blank exec_command, keep everything else")
-    co.add_argument("--before", metavar="YYYY-MM-DD",
-                    help="only compact sessions dated strictly before this")
-    co.add_argument("--keep-days", type=int, metavar="N",
-                    help="keep the last N days untouched, compact the rest")
-    co.add_argument("--min-size", type=float, default=0, metavar="MB",
-                    help="only touch files >= this many MB (default: all)")
-    co.add_argument("--dry-run", action="store_true",
-                    help="list what would be compacted, change nothing")
+    add_selection_flags(sub.add_parser(
+        "clean", help="blank heavy string values in-place"), "clean")
+    add_selection_flags(sub.add_parser(
+        "compact", help="drop telemetry + blank exec_command, keep everything else"), "compact")
 
     args = ap.parse_args()
     args.root = os.path.expanduser(args.root)

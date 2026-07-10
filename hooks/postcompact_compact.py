@@ -17,7 +17,10 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.expanduser("~/Sriinnu/Personal/codex-cleanup"))
+# Env override exists for the deployed/launchd case if someone relocates the checkout.
+CLEANUP_HOME = os.environ.get("CODEX_CLEANUP_HOME") or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, CLEANUP_HOME)
 
 
 def main() -> int:

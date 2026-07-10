@@ -23,8 +23,11 @@ import subprocess
 import sys
 import time
 
+# Env override exists for the deployed/launchd case if someone relocates the checkout.
+CLEANUP_HOME = os.environ.get("CODEX_CLEANUP_HOME") or os.path.dirname(os.path.abspath(__file__))
+
 DEFAULT_DB = os.path.expanduser("~/.codex/goals_1.sqlite")
-STATE_FILE = os.path.expanduser("~/Sriinnu/Personal/codex-cleanup/goal_watch_state.json")
+STATE_FILE = os.path.join(CLEANUP_HOME, "goal_watch_state.json")
 RENOTIFY_SECONDS = 12 * 3600  # don't re-nag about the same thread more than every 12h
 
 LIVE_STATUSES = ("active", "paused", "blocked", "usage_limited", "budget_limited")
@@ -93,14 +96,16 @@ def main() -> int:
         flagged.append((thread_id, objective, status, tokens_used, age_days))
         state[thread_id] = now_ms
 
-    save_state(state)
-
     if not flagged:
+        save_state(state)
         print("no goal threads over threshold right now")
         return 0
 
     for thread_id, objective, status, tokens_used, age_days in flagged:
-        short_obj = (objective or "").strip().splitlines()[0][:80]
+        # `or [""]`: empty/NULL objective -> splitlines() is [], and [0] on
+        # that crashed here once — with state already saved, the thread got
+        # marked "notified" for 12h without any notification ever firing.
+        short_obj = ((objective or "").strip().splitlines() or [""])[0][:80]
         print(f"{thread_id[:8]}  {status:14}  {tokens_used:>12,} tok  {age_days:5.1f}d  {short_obj}")
         if not args.quiet:
             notify(
@@ -108,6 +113,10 @@ def main() -> int:
                 f"{tokens_used:,} tokens, {age_days:.1f} days — {short_obj}",
             )
 
+    # Saved only after the notifications actually went out — recording a
+    # thread as "notified" before trying would throttle it for 12h even if
+    # this run crashed mid-loop.
+    save_state(state)
     return 0
 
 

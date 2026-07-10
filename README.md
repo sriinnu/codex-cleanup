@@ -67,12 +67,14 @@ Codex has its own hooks system (`hooks = true` in `config.toml`, config at
 from MCP, separate from plugins. These intervene *while a session is live*,
 instead of cleaning up after the fact. All three are wrapped to fail silent
 and fast on any error — a bug here must never block or slow down a real
-Codex session.
+Codex session. Every script and hook here derives its paths from its own
+checkout location (`CODEX_CLEANUP_HOME` overrides, for the deployed/launchd
+case) — the repo can live anywhere.
 
 | Hook | Script | Does |
 |---|---|---|
 | `PostToolUse` | `posttooluse_exec_compact.py` | **The actual token-cost fix.** Fires after every tool call. If `exec_command` output is large, archives the full raw text to `tool-output-archive/<session_id>/<call_id>.txt` and substitutes a head-tail-truncated version into the *recorded* transcript — so the bloat never gets resent on a future turn in the first place. |
-| `PreCompact` | `precompact_warn.py` | Fires the instant Codex decides a thread needs compacting. Cross-checks `~/.codex/goals_1.sqlite`; if the thread's already over 20M tokens or 3 days old, surfaces a warning right inside the live session plus a macOS notification. |
+| `PreCompact` | `precompact_warn.py` | Fires the instant Codex decides a thread needs compacting. Cross-checks `~/.codex/goals_1.sqlite`; if the thread's already over 20M tokens or 3 days old, surfaces a warning right inside the live session plus a macOS notification — the notification throttled to once per thread per 12h (a runaway thread compacts often), the in-session warning every time. |
 | `PostCompact` | `postcompact_compact.py` | Hooks are blocking, so Codex is genuinely idle on the transcript during this hook — a real, race-free window. Runs the same targeted compaction immediately, instead of waiting for the next scheduled pass. |
 
 **Tuning note:** Codex has its own native exec-output truncation ceiling
@@ -95,7 +97,18 @@ CODEX_HOOK_DEBUG=1 codex exec "..." 2>&1
 cat hooks/debug.log
 ```
 
-## Watchdogs — `goal_watch.py` + `vacuum_logs.sh`
+**Unverified assumption:** the PostToolUse hook emits `decision: "block"` and
+*assumes* Codex substitutes the truncated reason into the recorded transcript
+— that semantics comes from Claude Code's hook contract, and Codex was never
+verified end-to-end to honor it. `verify_block_behavior.py` settles it: run a
+session with a deliberately huge exec output, then check the rollout for the
+hook's marker. Reports PASS / FAIL / INCONCLUSIVE.
+
+```bash
+python3 verify_block_behavior.py --latest   # newest rollout under ~/.codex/sessions
+```
+
+## Watchdogs — `goal_watch.py`, `vacuum_logs.sh`, `archive_prune.py`
 
 Run via `launchd`, not `cron` — cron has no catch-up on macOS, so a job
 scheduled for a fixed time just silently doesn't run if the laptop's asleep
@@ -108,10 +121,14 @@ kept in `deployed/` here.
 | `com.sriinnu.codex-compact` | `codex_session_cleaner.py compact --keep-days 1` | RunAtLoad + every 6h |
 | `com.sriinnu.codex-vacuum` | `VACUUM`s `~/.codex/logs_2.sqlite` (Codex deletes old log rows but never reclaims the freed pages — a plain `VACUUM` alone took this from 2.5GB to 679MB with zero rows touched) | RunAtLoad + weekly |
 | `com.sriinnu.codex-goal-watch` | `goal_watch.py` — flags any `/goal` thread over 20M tokens or 3 days old via macOS notification, throttled to one nag per thread per 12h | RunAtLoad + every 2h |
+| `com.sriinnu.codex-archive-prune` | `archive_prune.py` — retention for `tool-output-archive/`, which the PostToolUse hook otherwise grows forever: deletes archived outputs older than 14 days, then oldest-first past a 500MB total cap (catches a single runaway day) | RunAtLoad + daily |
 
 ```bash
 python3 goal_watch.py
 python3 goal_watch.py --token-threshold 20000000 --age-days 3 --quiet
+
+python3 archive_prune.py --dry-run
+python3 archive_prune.py --keep-days 7 --max-total-mb 200
 
 bash vacuum_logs.sh   # backs up first, skips if Codex looks like it's running
 ```
@@ -120,9 +137,13 @@ bash vacuum_logs.sh   # backs up first, skips if Codex looks like it's running
 
 ```
 codex_session_cleaner.py   report / compact / clean
+cleanup.sh                  interactive one-shot wrapper around clean
 goal_watch.py               goals_1.sqlite watchdog
+archive_prune.py            tool-output-archive retention (age pass + size cap)
+verify_block_behavior.py    checks the PostToolUse block-substitution assumption
 vacuum_logs.sh               logs_2.sqlite VACUUM
 hooks/                      Codex-native PostToolUse/PreCompact/PostCompact
+tests/                      run with: python -m unittest discover -s tests
 deployed/                   copies of the live hooks.json + launchd plists
 backups/                    gitignored — local safety net, too large for the repo
 tool-output-archive/        gitignored — full raw exec output PostToolUse archives

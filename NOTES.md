@@ -57,6 +57,9 @@ problem is still open as of this writing).
 - **4 of 6 dead `usage_limited` goal threads archived** via `codex archive`
   (2 failed with a generic error, non-blocking, retry from the TUI if it
   matters).
+- **`codex_session_cleaner.py` internals deduped** — `clean` and `compact`
+  now share one target-selection + batch-run path instead of two parallel
+  copies. Invisible to users: output and `--help` verified byte-identical.
 
 Full backups of everything touched: `codex-cleanup/backups/` (gitignored,
 too large for the repo — local safety net only).
@@ -73,8 +76,14 @@ they survive sleep/wake instead of depending on hitting an exact clock time.
 | `com.sriinnu.codex-compact` | `codex_session_cleaner.py compact --keep-days 1` | RunAtLoad + every 6h |
 | `com.sriinnu.codex-vacuum` | `VACUUM`s `logs_2.sqlite` | RunAtLoad + weekly |
 | `com.sriinnu.codex-goal-watch` | `goal_watch.py` — flags any goal thread over 20M tokens or 3 days old, macOS notification, throttled to one nag per thread per 12h | RunAtLoad + every 2h |
+| `com.sriinnu.codex-archive-prune` | `archive_prune.py` — retention for the PostToolUse `tool-output-archive/`, which otherwise grows forever (the exact unbounded-growth problem this repo exists to solve): age pass (>14 days) then oldest-first size cap (500MB total) | RunAtLoad + daily |
 
 Plists live in `~/Library/LaunchAgents/`, copies kept in `deployed/` here.
+
+All scripts and hooks now derive their paths from their own checkout
+location, with `CODEX_CLEANUP_HOME` as an env override for the
+deployed/launchd case — nothing hardcodes the repo path anymore except the
+plists themselves, which are Mac-specific by nature.
 
 ## Codex-native hooks (the real fix, not just disk cleanup)
 
@@ -93,7 +102,11 @@ separate from the plugin system. Three installed:
   decides a thread needs compacting (the earliest, most precise signal
   available). Cross-checks `goals_1.sqlite`; if the thread's already over
   threshold, surfaces a warning via `systemMessage` right inside the live
-  session, plus a macOS notification.
+  session, plus a macOS notification. The notification is throttled to once
+  per thread per 12h (state in `precompact_state.json`, same pattern as
+  `goal_watch.py` — a runaway thread compacts often); the `systemMessage`
+  fires on every compaction. Corrupt or unwritable throttle state means
+  notify anyway — a lost throttle is annoying, a crashed hook unacceptable.
 - **`PostCompact`** (`hooks/postcompact_compact.py`) — hooks are blocking,
   so Codex is genuinely idle on the transcript during this hook's
   execution — a real, race-free window. Runs the same `compact_file()`
@@ -120,6 +133,9 @@ code must never block or slow down a real Codex session.
   duplicating the content instead of shrinking it. Fixed by deriving
   `TRUNCATE_THRESHOLD` from `KEEP_HEAD + KEEP_TAIL + MIN_SAVINGS` so the
   math can't go negative by construction.
+- Codex only ever sends `exec_command` as the tool name (empirically
+  confirmed) — `TOOL_NAMES` trimmed to `{"exec_command", "shell"}`, with
+  `shell` kept as cheap insurance against an upstream rename.
 - Also discovered `gpt-5.3-codex-spark` is a real, working model
   (confirmed live against the backend) that draws from a *separate quota
   pool* than the main model — useful when the primary model is
@@ -130,6 +146,13 @@ code must never block or slow down a real Codex session.
 
 - The OpenAI issue comment (drafted, includes the hard numbers above) —
   posted by Sriinnu, not auto-sent.
+- The PostToolUse `decision: "block"` transcript-substitution assumption is
+  still unverified end-to-end — the "block" semantics come from Claude
+  Code's hook contract, and Codex may record the raw output regardless.
+  `verify_block_behavior.py` exists for exactly this; pending a live Mac
+  test: run a session with a deliberately huge exec output, then
+  `python3 verify_block_behavior.py --latest` for a PASS/FAIL/INCONCLUSIVE
+  verdict.
 - 2 of the 6 dead goal threads never archived (generic CLI error, low
   stakes).
 - `logs_2.sqlite`'s root cause (Codex deletes without vacuuming) isn't
