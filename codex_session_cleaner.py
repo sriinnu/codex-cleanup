@@ -11,7 +11,12 @@ they balloon into the gigabytes. This tool:
            line counts all survive, so Codex can still list the sessions
   compact  lighter touch than clean: drops pure-telemetry lines
            (token_count, and agent_message since it's a duplicate of the
-           response_item copy) and blanks only exec_command args/output.
+           response_item copy), blanks exec_command args/output, dedupes
+           the full system prompt that session_meta re-embeds on every
+           fork/compaction (kept once per file, blanked after), and trims
+           replacement_history out of every compacted snapshot except the
+           newest (older ones are superseded the moment a later compaction
+           happens — Codex only needs the latest to resume).
            Reasoning, messages, patches, plans, goal state, sub-agent
            markers all survive untouched — for sessions you still want to
            read later, not ones you're writing off.
@@ -288,8 +293,12 @@ DROP_EVENT_TYPES = {"token_count", "agent_message"}
 # the majority of lines (reasoning, messages, patches, plan updates...) that
 # can't possibly match, both for speed and so untouched lines never risk
 # picking up json.dumps' default whitespace and quietly growing the file.
+# session_meta/compacted use bare words (no surrounding quotes) since their
+# JSON spacing isn't guaranteed and the type check right after json.loads
+# is what actually decides correctness — this is just the cheap pre-filter.
 TRIGGER_SUBSTRINGS = ('"token_count"', '"agent_message"',
-                      '"exec_command"', '"function_call_output"')
+                      '"exec_command"', '"function_call_output"',
+                      'session_meta', 'compacted')
 
 # Wording must match the placeholder hooks/posttooluse_exec_compact.py writes
 # into function_call_output.output when it archives+truncates a large exec
@@ -303,7 +312,7 @@ def _already_archived(text) -> bool:
     return isinstance(text, str) and ARCHIVED_MARKER in text
 
 
-def compact_line(line: str, call_names: dict):
+def compact_line(line: str, call_names: dict, session_state: dict = None):
     """Return (output_line_or_None, changed) for one raw JSONL line.
 
     None means drop the line entirely. changed=False means: don't bother
@@ -312,6 +321,11 @@ def compact_line(line: str, call_names: dict):
     exec_command function_call_output whose own content happens to contain
     an incidental "token_count"/"agent_message" substring must still reach
     the exec-blanking branch below, not bail out on the telemetry check.
+
+    session_state carries the two cross-line counters session_meta/compacted
+    handling need (call_names only ever needs the current line). None means
+    "caller doesn't want this dedup" — used by tests that only care about the
+    exec_command path — and both branches degrade to a no-op passthrough.
     """
     if not any(s in line for s in TRIGGER_SUBSTRINGS):
         return line, False
@@ -320,12 +334,46 @@ def compact_line(line: str, call_names: dict):
     except json.JSONDecodeError:
         return line, False
 
-    if obj.get("type") == "event_msg":
+    t = obj.get("type")
+
+    if t == "session_meta":
+        if session_state is None:
+            return line, False
+        bi = obj.get("payload", {}).get("base_instructions")
+        if not isinstance(bi, dict) or not bi.get("text"):
+            return line, False
+        if not session_state.get("seen_base_instructions"):
+            session_state["seen_base_instructions"] = True
+            return line, False
+        # Every later fork/compaction re-embeds the same fixed system prompt
+        # byte-for-byte — one copy per file is enough for Codex to know what
+        # was in play; the rest is pure duplication.
+        bi["text"] = ""
+        return json.dumps(obj, separators=(",", ":")) + "\n", True
+
+    if t == "compacted":
+        if session_state is None:
+            return line, False
+        session_state["compacted_seen"] = session_state.get("compacted_seen", 0) + 1
+        is_last = session_state["compacted_seen"] >= session_state.get("total_compacted", 0)
+        # replacement_history lives under payload, not the top level.
+        cp = obj.get("payload", {})
+        if is_last or not cp.get("replacement_history"):
+            return line, False
+        # Superseded the moment a later compaction happened — only the
+        # newest replacement_history is what Codex actually reloads to
+        # resume the thread; earlier ones are stale audit snapshots that
+        # never shrink on their own (that's the bug this whole tool exists
+        # to route around).
+        cp["replacement_history"] = []
+        return json.dumps(obj, separators=(",", ":")) + "\n", True
+
+    if t == "event_msg":
         if obj.get("payload", {}).get("type") in DROP_EVENT_TYPES:
             return None, True
         return line, False
 
-    if obj.get("type") != "response_item":
+    if t != "response_item":
         return line, False
 
     p = obj.get("payload", {})
@@ -355,20 +403,44 @@ def compact_line(line: str, call_names: dict):
     return line, False
 
 
+def _count_compacted(path: str) -> int:
+    """Pre-pass so compact_line can tell, while streaming forward, whether
+    the compacted entry it's looking at is the last one in the file (and
+    therefore the only one worth keeping full). Cheap: same substring
+    pre-filter, one extra sequential read."""
+    n = 0
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            if "compacted" not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "compacted":
+                n += 1
+    return n
+
+
 def compact_file(path: str) -> tuple:
-    """Drop telemetry lines and blank exec_command payloads, atomically.
+    """Drop telemetry lines, blank exec_command payloads, dedupe repeated
+    session_meta system prompts, and trim stale compacted snapshots —
+    atomically.
 
     Returns (before_bytes, after_bytes, dropped_lines, edited_lines, skip_reason).
     """
+    total_compacted = _count_compacted(path)
     before = os.path.getsize(path)
     orig_stat = os.stat(path)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
     call_names = {}
+    session_state = {"seen_base_instructions": False, "compacted_seen": 0,
+                     "total_compacted": total_compacted}
     dropped = edited = 0
     try:
         with os.fdopen(fd, "w") as out, open(path, "r", errors="replace") as f:
             for line in f:
-                new_line, changed = compact_line(line, call_names)
+                new_line, changed = compact_line(line, call_names, session_state)
                 if new_line is None:
                     dropped += 1
                     continue
