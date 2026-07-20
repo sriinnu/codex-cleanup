@@ -73,7 +73,7 @@ def pick_targets(entries: list, keep_days: int, max_total_bytes: int, now: float
     archived outputs is still within the retention window — posttooluse_
     exec_compact.py promises the full original is "always recoverable from
     the archive", but a long-running /goal thread (the exact incident this
-    repo exists to fix — see NOTES.md) keeps archiving new calls for weeks,
+    repo exists to fix — see README) keeps archiving new calls for weeks,
     so its early calls would otherwise individually age out from under a
     still-open, still-referencing transcript. The size cap stays activity-
     blind on purpose: it's the safety valve for a single runaway day dumping

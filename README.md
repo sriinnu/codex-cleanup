@@ -7,9 +7,15 @@
 Codex CLI session rollouts (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`) grow into
 the gigabytes because every context compaction re-writes the *entire*
 conversation history into the file, on top of raw tool outputs and reasoning
-blobs. One `/goal` thread left running for 24 days burned 559M tokens on its
-own before hitting `usage_limited`. Full incident writeup: [NOTES.md](NOTES.md).
-Upstream bug report: [openai/codex#24948](https://github.com/openai/codex/issues/24948).
+blobs, and `thread_goals` keys `goal_id` off `thread_id` as a 1:1 primary
+key — there's no supported way to continue a goal in a fresh thread, only
+start a new one and lose continuity. One `/goal` thread left running for 24
+days burned 559M tokens on its own before hitting `usage_limited`. Not a
+one-off: cross-checking `goals_1.sqlite` found 6 of 12 tracked goal threads
+had independently hit `usage_limited`, totaling 929M of ~1.05B cumulative
+tokens — the default outcome for any `/goal` run left unattended more than
+a few days. Upstream bug report:
+[openai/codex#24948](https://github.com/openai/codex/issues/24948).
 
 This repo does two things:
 
@@ -94,9 +100,11 @@ sed "s|__CODEX_CLEANUP_HOME__|$PWD|g" deployed/hooks.json > ~/.codex/hooks.json
 untouched, 2,000 got truncated to ~300 by Codex itself before the hook ever
 saw it). `posttooluse_exec_compact.py`'s `KEEP_HEAD`/`KEEP_TAIL` are set
 below that ceiling on purpose, to catch what Codex lets through untouched
-rather than duplicate work it already does. See `NOTES.md` for how this was
-found and calibrated, including a bug where text shorter than
-`KEEP_HEAD + KEEP_TAIL` produced a negative "chars truncated" count.
+rather than duplicate work it already does. Found and calibrated via live
+testing with `CODEX_HOOK_DEBUG=1`; also caught a bug where text shorter
+than `KEEP_HEAD + KEEP_TAIL` produced a negative "chars truncated" count,
+fixed by deriving the truncation threshold from `KEEP_HEAD + KEEP_TAIL +
+MIN_SAVINGS` so the math can't go negative by construction.
 
 Debug a hook without touching a real session:
 
@@ -165,12 +173,9 @@ deployed/                   templated hooks.json + launchd plists (install_launc
 assets/                     the logo up top
 backups/                    gitignored — local safety net, too large for the repo
 tool-output-archive/        gitignored — full raw exec output PostToolUse archives
-NOTES.md                    full incident writeup, findings, what's still open
+KNOWN_ISSUES.md             plain engineering notes on what's still open
 ```
 
 ## What's still open
 
-See [NOTES.md](NOTES.md#whats-still-open) — the filed upstream issue, two
-goal threads that wouldn't archive, and the log-vacuum job being a
-recurring workaround rather than a real fix for Codex's own delete-without-
-vacuum behavior.
+See [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
