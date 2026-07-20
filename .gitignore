@@ -5,3 +5,4 @@ backups/
 goal_watch_state.json
 precompact_state.json
 tool-output-archive/
+.DS_Store

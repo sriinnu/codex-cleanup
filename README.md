@@ -161,7 +161,7 @@ verify_block_behavior.py    checks the PostToolUse block-substitution assumption
 vacuum_logs.sh               logs_2.sqlite VACUUM
 hooks/                      Codex-native PostToolUse/PreCompact/PostCompact
 tests/                      run with: python -m unittest discover -s tests
-deployed/                   copies of the live hooks.json + launchd plists
+deployed/                   templated hooks.json + launchd plists (install_launchd.sh)
 assets/                     the logo up top
 backups/                    gitignored — local safety net, too large for the repo
 tool-output-archive/        gitignored — full raw exec output PostToolUse archives
