@@ -5,9 +5,8 @@ doesn't have to be re-derived from scratch next time.
 
 ## The problem
 
-One Codex `/goal` thread (`REDACTED-THREAD-ID`, project
-`REDACTED-PROJECT`) ran continuously for **24 days** (2026-06-14 → 2026-07-08) without
-ever rotating to a fresh session:
+One Codex `/goal` thread ran continuously for **24 days**
+(2026-06-14 → 2026-07-08) without ever rotating to a fresh session:
 
 - 613,100 lines / 202MB rollout file
 - 126,748 `exec_command` calls, 14,681 `apply_patch` calls, 883 nested
@@ -144,8 +143,8 @@ code must never block or slow down a real Codex session.
 
 ## What's still open
 
-- The OpenAI issue comment (drafted, includes the hard numbers above) —
-  posted by Sriinnu, not auto-sent.
+- The OpenAI issue comment (drafted, includes the hard numbers above) is
+  posted manually, not auto-sent.
 - The PostToolUse `decision: "block"` transcript-substitution assumption is
   still unverified end-to-end — the "block" semantics come from Claude
   Code's hook contract, and Codex may record the raw output regardless.

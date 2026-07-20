@@ -67,13 +67,21 @@ KEEP_DAYS=14 MIN_SIZE=5 ./cleanup.sh
 ## Real-time hooks — `hooks/`
 
 Codex has its own hooks system (`hooks = true` in `config.toml`, config at
-`~/.codex/hooks.json`, deployed copy in `deployed/hooks.json`) — separate
+`~/.codex/hooks.json`, template in `deployed/hooks.json`) — separate
 from MCP, separate from plugins. These intervene *while a session is live*,
 instead of cleaning up after the fact. All three are wrapped to fail silent
 and fast on any error — a bug here must never block or slow down a real
 Codex session. Every script and hook here derives its paths from its own
 checkout location (`CODEX_CLEANUP_HOME` overrides, for the deployed/launchd
 case) — the repo can live anywhere.
+
+To install: swap `__CODEX_CLEANUP_HOME__` in `deployed/hooks.json` for this
+checkout's absolute path and copy the result to `~/.codex/hooks.json`
+(merge by hand if you already have hooks configured there):
+
+```bash
+sed "s|__CODEX_CLEANUP_HOME__|$PWD|g" deployed/hooks.json > ~/.codex/hooks.json
+```
 
 | Hook | Script | Does |
 |---|---|---|
@@ -117,8 +125,13 @@ python3 verify_block_behavior.py --latest   # newest rollout under ~/.codex/sess
 Run via `launchd`, not `cron` — cron has no catch-up on macOS, so a job
 scheduled for a fixed time just silently doesn't run if the laptop's asleep
 then. `launchd` agents trigger on load (login) plus a periodic interval, so
-they survive sleep/wake. Plists live in `~/Library/LaunchAgents/`, copies
+they survive sleep/wake. Plists live in `~/Library/LaunchAgents/`, templates
 kept in `deployed/` here.
+
+Install all four with `./install_launchd.sh` — it substitutes
+`__CODEX_CLEANUP_HOME__` for this checkout's actual path, copies each plist
+into `~/Library/LaunchAgents/`, and loads it. Re-running is safe (unloads
+before reloading).
 
 | Agent | Does | Cadence |
 |---|---|---|
@@ -148,7 +161,7 @@ verify_block_behavior.py    checks the PostToolUse block-substitution assumption
 vacuum_logs.sh               logs_2.sqlite VACUUM
 hooks/                      Codex-native PostToolUse/PreCompact/PostCompact
 tests/                      run with: python -m unittest discover -s tests
-deployed/                   copies of the live hooks.json + launchd plists
+deployed/                   templated hooks.json + launchd plists (install_launchd.sh)
 assets/                     the logo up top
 backups/                    gitignored — local safety net, too large for the repo
 tool-output-archive/        gitignored — full raw exec output PostToolUse archives
