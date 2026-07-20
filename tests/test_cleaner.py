@@ -39,6 +39,16 @@ def resp(payload) -> str:
     return jline({"type": "response_item", "payload": payload})
 
 
+def session_meta(text, **extra) -> str:
+    return jline({"type": "session_meta",
+                  "payload": dict(extra, base_instructions={"text": text})})
+
+
+def compacted(history, **extra) -> str:
+    return jline({"type": "compacted",
+                  "payload": dict(extra, message="", replacement_history=history)})
+
+
 def read_text(p: str) -> str:
     with open(p) as f:
         return f.read()
@@ -130,6 +140,54 @@ class TestCompactLine(unittest.TestCase):
     def test_untouched_line_keeps_exact_bytes(self):
         # Odd spacing would be lost if this line were ever re-serialized.
         line = '{ "exec_command" : "mentioned", "type" : "other" }\n'
+        out, changed = csc.compact_line(line, {})
+        self.assertIs(out, line)
+        self.assertFalse(changed)
+
+    def state(self, total_compacted=0):
+        return {"seen_base_instructions": False, "compacted_seen": 0,
+                "total_compacted": total_compacted}
+
+    def test_first_session_meta_kept_intact(self):
+        line = session_meta("full system prompt", id="a")
+        out, changed = csc.compact_line(line, {}, self.state())
+        self.assertIs(out, line)
+        self.assertFalse(changed)
+
+    def test_repeat_session_meta_base_instructions_blanked(self):
+        state = self.state()
+        csc.compact_line(session_meta("full system prompt", id="a"), {}, state)
+        out, changed = csc.compact_line(
+            session_meta("full system prompt", id="b"), {}, state)
+        self.assertTrue(changed)
+        obj = json.loads(out)
+        self.assertEqual(obj["payload"]["base_instructions"]["text"], "")
+        self.assertEqual(obj["payload"]["id"], "b")  # structural fields survive
+
+    def test_session_meta_without_state_passes_through(self):
+        line = session_meta("full system prompt", id="a")
+        out, changed = csc.compact_line(line, {})
+        self.assertIs(out, line)
+        self.assertFalse(changed)
+
+    def test_earlier_compacted_history_trimmed(self):
+        state = self.state(total_compacted=2)
+        line = compacted([{"role": "user", "text": "old"}], window_id="w1")
+        out, changed = csc.compact_line(line, {}, state)
+        self.assertTrue(changed)
+        obj = json.loads(out)
+        self.assertEqual(obj["payload"]["replacement_history"], [])
+        self.assertEqual(obj["payload"]["window_id"], "w1")  # structural fields survive
+
+    def test_last_compacted_history_kept(self):
+        state = self.state(total_compacted=1)
+        line = compacted([{"role": "user", "text": "current"}], window_id="w1")
+        out, changed = csc.compact_line(line, {}, state)
+        self.assertIs(out, line)
+        self.assertFalse(changed)
+
+    def test_compacted_without_state_passes_through(self):
+        line = compacted([{"role": "user", "text": "x"}])
         out, changed = csc.compact_line(line, {})
         self.assertIs(out, line)
         self.assertFalse(changed)
@@ -270,6 +328,26 @@ class TestCompactFile(TempTreeMixin):
         self.assertIn("changed during processing", skip)
         self.assertEqual(before, after)
         self.assertEqual(read_text(p), original + "x")
+        self.assert_no_tmp_left(p)
+
+    def test_dedupes_session_meta_and_trims_old_compacted(self):
+        lines = [
+            session_meta("SYSTEM PROMPT", id="a"),
+            compacted([{"text": "w1"}], window_id="w1"),
+            session_meta("SYSTEM PROMPT", id="b"),
+            compacted([{"text": "w2 latest"}], window_id="w2"),
+        ]
+        p = self.make_jsonl(lines)
+        before, after, dropped, edited, skip = csc.compact_file(p)
+        self.assertIsNone(skip)
+        self.assertLess(after, before)
+        with open(p) as f:
+            out = [json.loads(l) for l in f.read().splitlines()]
+        self.assertEqual(out[0]["payload"]["base_instructions"]["text"], "SYSTEM PROMPT")
+        self.assertEqual(out[1]["payload"]["replacement_history"], [])
+        self.assertEqual(out[2]["payload"]["base_instructions"]["text"], "")
+        self.assertEqual(out[2]["payload"]["id"], "b")
+        self.assertEqual(out[3]["payload"]["replacement_history"], [{"text": "w2 latest"}])
         self.assert_no_tmp_left(p)
 
 
