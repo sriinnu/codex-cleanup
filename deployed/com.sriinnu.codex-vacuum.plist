@@ -7,15 +7,15 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/vacuum_logs.sh</string>
+        <string>__CODEX_CLEANUP_HOME__/vacuum_logs.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>StartInterval</key>
     <integer>604800</integer>
     <key>StandardOutPath</key>
-    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/vacuum.log</string>
+    <string>__CODEX_CLEANUP_HOME__/vacuum.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/vacuum.log</string>
+    <string>__CODEX_CLEANUP_HOME__/vacuum.log</string>
 </dict>
 </plist>

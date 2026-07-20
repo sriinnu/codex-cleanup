@@ -7,15 +7,15 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/goal_watch.py</string>
+        <string>__CODEX_CLEANUP_HOME__/goal_watch.py</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>StartInterval</key>
     <integer>7200</integer>
     <key>StandardOutPath</key>
-    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/goal_watch.log</string>
+    <string>__CODEX_CLEANUP_HOME__/goal_watch.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/goal_watch.log</string>
+    <string>__CODEX_CLEANUP_HOME__/goal_watch.log</string>
 </dict>
 </plist>

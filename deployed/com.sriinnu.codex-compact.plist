@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/codex_session_cleaner.py</string>
+        <string>__CODEX_CLEANUP_HOME__/codex_session_cleaner.py</string>
         <string>compact</string>
         <string>--keep-days</string>
         <string>1</string>
@@ -19,8 +19,8 @@
     <key>StartInterval</key>
     <integer>21600</integer>
     <key>StandardOutPath</key>
-    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/compact.log</string>
+    <string>__CODEX_CLEANUP_HOME__/compact.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/compact.log</string>
+    <string>__CODEX_CLEANUP_HOME__/compact.log</string>
 </dict>
 </plist>

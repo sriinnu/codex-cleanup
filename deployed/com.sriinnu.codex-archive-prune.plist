@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/archive_prune.py</string>
+        <string>__CODEX_CLEANUP_HOME__/archive_prune.py</string>
         <string>--keep-days</string>
         <string>14</string>
     </array>
@@ -16,8 +16,8 @@
     <key>StartInterval</key>
     <integer>86400</integer>
     <key>StandardOutPath</key>
-    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/archive_prune.log</string>
+    <string>__CODEX_CLEANUP_HOME__/archive_prune.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/srinivaspendela/Sriinnu/Personal/codex-cleanup/archive_prune.log</string>
+    <string>__CODEX_CLEANUP_HOME__/archive_prune.log</string>
 </dict>
 </plist>
