@@ -25,18 +25,26 @@ CLEANUP_HOME = os.environ.get("CODEX_CLEANUP_HOME") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))
 
 ARCHIVE_ROOT = os.path.join(CLEANUP_HOME, "tool-output-archive")
-# Codex's own native exec-output truncation kicks in somewhere around
-# 1000-2000 raw chars (confirmed empirically: 1000 chars passed through
-# untouched, 2000 chars got truncated to ~300 by Codex itself before this
-# hook ever saw it). Anything above that ceiling is already handled — our
-# real gap is the band Codex lets through untouched but that's still worth
-# trimming further. Keep head/tail small enough to sit below that ceiling.
-KEEP_HEAD = 300
-KEEP_TAIL = 300
-MIN_SAVINGS = 400
+# Codex natively truncates tool output at `tool_output_token_limit`
+# (default 10000 tokens — verified from truncation notices clustering at
+# "original token count: 10017/10025/10041", and from a hard cliff at 40KB
+# in the output-size distribution). ~/.codex/config.toml now pins that to
+# 2000 tokens (~8KB), which does the bulk of the work. This hook is the
+# second stage under it: cut further to a head/tail window and archive the
+# full original to disk so nothing is actually lost. Failure signals
+# concentrate at the start and end of output, so head+tail is the right
+# shape. Keep the window generous enough that the model doesn't re-run the
+# command to recover detail — a re-run costs more than the bytes saved.
+KEEP_HEAD = 1500
+KEEP_TAIL = 1500
+MIN_SAVINGS = 500
 TRUNCATE_THRESHOLD = KEEP_HEAD + KEEP_TAIL + MIN_SAVINGS
-# Codex only ever sends "exec_command" (empirically confirmed); "shell" kept as cheap insurance against a rename.
-TOOL_NAMES = {"exec_command", "shell"}
+# "exec" is the code_mode tool (features.code_mode_host) and is what the
+# model actually calls — 5011 calls / 52.2MB over a measured 24h, versus
+# 123 calls for "exec_command". Omitting it is why this hook never fired
+# once between 2026-07-10 and 2026-09-03: tool-output-archive/ held nothing
+# but .DS_Store. "exec_command"/"shell" kept for the non-code_mode path.
+TOOL_NAMES = {"exec", "exec_command", "shell"}
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 
@@ -59,6 +67,21 @@ def sanitize_id(value) -> str:
 def extract_text(tool_response) -> str:
     if isinstance(tool_response, str):
         return tool_response
+    # code_mode's "exec" returns a list of content blocks
+    # ([{"type": "input_text", "text": ...}, ...]), not a string or a dict.
+    # Without this branch it fell through to json.dumps() and the truncated
+    # replacement would have been a JSON blob instead of readable output.
+    if isinstance(tool_response, list):
+        parts = []
+        for item in tool_response:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                v = item.get("text") or item.get("output") or item.get("content")
+                parts.append(v if isinstance(v, str) else json.dumps(item))
+            else:
+                parts.append(json.dumps(item))
+        return "".join(parts)
     if isinstance(tool_response, dict):
         for key in ("output", "content", "stdout", "text"):
             v = tool_response.get(key)
