@@ -15,9 +15,11 @@ Usage:
 """
 
 import argparse
+import datetime
 import glob
 import json
 import os
+import re
 import sys
 
 # Must match the reason string emitted by hooks/posttooluse_exec_compact.py.
@@ -36,12 +38,44 @@ except Exception:
     TRUNCATE_THRESHOLD = 1000  # fallback: hook default (KEEP_HEAD + KEEP_TAIL + MIN_SAVINGS)
 
 
+# rollout-2026-09-03T07-39-26-<uuid>.jsonl -> the session's start time.
+_ROLLOUT_TS = re.compile(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-")
+
+
+def session_start(path: str):
+    """Session start from the filename, or None if it doesn't parse."""
+    m = _ROLLOUT_TS.search(os.path.basename(path))
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H-%M-%S")
+    except ValueError:
+        return None
+
+
 def find_latest() -> str:
+    """Newest session by START TIME, not mtime.
+
+    mtime is not trustworthy here: housekeeping (the compact/clean jobs, a
+    resumed thread, Codex's own rollout migration) rewrites old rollout
+    files and bumps their timestamps. Sorting by mtime picked a session
+    from 2026-07-10 while sessions from today sat right beside it, and the
+    resulting FAIL looked like a real verdict instead of a stale file. The
+    filename carries the session start and nothing ever rewrites it.
+    """
     root = os.path.expanduser("~/.codex/sessions")
     paths = glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
     if not paths:
         sys.exit(f"no .jsonl files found under {root}")
-    return max(paths, key=os.path.getmtime)
+    dated = [(session_start(p), p) for p in paths]
+    dated = [(ts, p) for ts, p in dated if ts is not None]
+    if not dated:
+        # No parseable names at all: mtime is all that's left, but say so.
+        print("warning: no rollout-<timestamp> filenames found; "
+              "falling back to mtime, which housekeeping can bump.",
+              file=sys.stderr)
+        return max(paths, key=os.path.getmtime)
+    return max(dated)[1]
 
 
 def output_text(out) -> str:
@@ -113,7 +147,14 @@ def main() -> int:
                         and len(text) > TRUNCATE_THRESHOLD:
                     oversized_unmarked += 1
 
+    started = session_start(path)
     print(f"file: {path}")
+    if started is not None:
+        age_h = (datetime.datetime.now() - started).total_seconds() / 3600
+        note = f"session started: {started:%Y-%m-%d %H:%M} ({age_h:.1f}h ago)"
+        if age_h > 6:
+            note += "  <-- STALE: this is not a session you just ran"
+        print(note)
     print(f"tool output records (function_call + custom_tool_call): {total_outputs}")
     print(f"  with hook marker (substitution WORKED):        {substituted}")
     print(f"  exec outputs > {TRUNCATE_THRESHOLD} chars, NO marker (NOT working): {oversized_unmarked}")
