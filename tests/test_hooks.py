@@ -115,9 +115,16 @@ class TestPostToolUse(HookTestBase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
 
-    def test_other_tool_name_ignored(self):
+    def test_codex_bash_tool_name_trimmed(self):
+        # Codex hooks report shell calls as "Bash"; skipping it left the hook dead.
         text = "x" * (self.hook.TRUNCATE_THRESHOLD * 3)
         r = run_hook(POSTTOOL, self.payload(text, tool="Bash"), self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('"decision": "block"', r.stdout)
+
+    def test_other_tool_name_ignored(self):
+        text = "x" * (self.hook.TRUNCATE_THRESHOLD * 3)
+        r = run_hook(POSTTOOL, self.payload(text, tool="Read"), self.home)
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
         self.assertFalse(
