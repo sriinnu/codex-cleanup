@@ -44,7 +44,8 @@ TRUNCATE_THRESHOLD = KEEP_HEAD + KEEP_TAIL + MIN_SAVINGS
 # 123 calls for "exec_command". Omitting it is why this hook never fired
 # once between 2026-07-10 and 2026-09-03: tool-output-archive/ held nothing
 # but .DS_Store. "exec_command"/"shell" kept for the non-code_mode path.
-TOOL_NAMES = {"exec", "exec_command", "shell"}
+# Codex hooks report shell calls as "Bash" (developers.openai.com/codex/hooks); without it this never fired (2 archives ever, 0 since 2026-11-10).
+TOOL_NAMES = {"Bash", "exec", "exec_command", "shell"}
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 
